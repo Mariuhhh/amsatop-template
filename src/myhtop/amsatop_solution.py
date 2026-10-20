@@ -3,7 +3,7 @@ from typing import List
 
 from amsatop import Htop, Process, TaskType
 
-# Màscara de bits de Linux per detectar Kernel Threads
+# Máscara de bits de Linux para detectar Kernel Threads
 PF_KTHREAD = 0x00200000
 
 
@@ -11,7 +11,11 @@ class Amsatop(Htop):
     def __init__(self):
         super().__init__()
 
-    def get_processes(self) -> List[Process]:
+    def _parse_processes(self, include_priority: bool = False) -> List[Process]:
+        """Función auxiliar para obtener los procesos, threads y kthreads.
+
+        Si include_priority es True, lee e incluye la prioridad.
+        """
         processes: List[Process] = []
 
         try:
@@ -38,10 +42,8 @@ class Amsatop(Htop):
                 if lpar_index == -1 or rpar_index == -1:
                     continue
 
-                # Extreure el nom de la comanda compresa entre '(' i ')' a /proc/{pid}/stat
                 command = stat_content[lpar_index + 1 : rpar_index]
 
-                # Si existeix el fitxer 'comm', utilitza'l si conté dades
                 if os.path.exists(comm_file):
                     try:
                         with open(comm_file, "r") as f:
@@ -51,35 +53,40 @@ class Amsatop(Htop):
                     except (FileNotFoundError, PermissionError, ProcessLookupError):
                         pass
 
-                # Després del parèntesi de tancament, parsejar els valors restants
                 after_comm = stat_content[rpar_index + 1 :].split()
                 flags = 0
+                priority_val = None
+
                 if len(after_comm) >= 7:
                     flags = int(after_comm[6])
 
-                # Comprovar si és un Kernel Thread (kthread)
+                # En /proc/{pid}/stat, la prioridad es el campo 18 (índice 15 tras la comanda)
+                if include_priority and len(after_comm) >= 16:
+                    priority_val = int(after_comm[15])
+
+                # Comprobar si es Kernel Thread
                 if (flags & PF_KTHREAD) != 0:
                     processes.append(
                         Process(
                             pid=int(pid),
                             command=command,
                             type=TaskType.KTHREAD,
-                            priority=None,
+                            priority=priority_val,
                         )
                     )
                     continue
 
-                # Procés normal (PROCESS)
+                # Proceso normal
                 processes.append(
                     Process(
                         pid=int(pid),
                         command=command,
                         type=TaskType.PROCESS,
-                        priority=None,
+                        priority=priority_val,
                     )
                 )
 
-                # Cercar threads secundaris a la carpeta task
+                # Threads secundarios
                 task_folder = os.path.join(proc_path, "task")
                 if os.path.exists(task_folder):
                     try:
@@ -93,6 +100,7 @@ class Amsatop(Htop):
                             thread_comm_file = os.path.join(task_folder, tid, "comm")
 
                             thread_cmd = None
+                            thread_priority = None
 
                             if os.path.exists(thread_comm_file):
                                 try:
@@ -101,18 +109,21 @@ class Amsatop(Htop):
                                 except (FileNotFoundError, PermissionError, ProcessLookupError):
                                     pass
 
-                            if thread_cmd is None and os.path.exists(thread_stat_file):
+                            if os.path.exists(thread_stat_file):
                                 try:
                                     with open(thread_stat_file, "r") as f:
                                         t_content = f.read()
                                         tl = t_content.find("(")
                                         tr = t_content.rfind(")")
                                         if tl != -1 and tr != -1:
-                                            thread_cmd = t_content[tl + 1 : tr]
+                                            if thread_cmd is None:
+                                                thread_cmd = t_content[tl + 1 : tr]
+                                            t_after = t_content[tr + 1 :].split()
+                                            if include_priority and len(t_after) >= 16:
+                                                thread_priority = int(t_after[15])
                                 except (FileNotFoundError, PermissionError, ProcessLookupError):
                                     pass
 
-                            # Si el thread ha finalitzat, no tindrà ni comm ni stat actius
                             if thread_cmd is None:
                                 continue
 
@@ -121,7 +132,7 @@ class Amsatop(Htop):
                                     pid=int(tid),
                                     command=thread_cmd,
                                     type=TaskType.THREAD,
-                                    priority=None,
+                                    priority=thread_priority,
                                 )
                             )
 
@@ -130,8 +141,11 @@ class Amsatop(Htop):
 
         return processes
 
+    def get_processes(self) -> List[Process]:
+        return self._parse_processes(include_priority=False)
+
     def get_priorities(self) -> List[Process]:
-        raise NotImplementedError("Prac-2.2 implementation needed")
+        return self._parse_processes(include_priority=True)
 
     def get_hup(self) -> List[Process]:
         raise NotImplementedError("Prac-2.3 implementation needed")
