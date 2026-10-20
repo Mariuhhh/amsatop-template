@@ -3,18 +3,41 @@ from typing import List
 
 from amsatop import Htop, Process, TaskType
 
-# Máscara de bits de Linux para detectar Kernel Threads
+# Màscara de bits de Linux per detectar Kernel Threads
 PF_KTHREAD = 0x00200000
+
+# Màscara de bits per al senyal 1 (SIGHUP): 2^(1-1) = 1
+SIGHUP_MASK = 1
 
 
 class Amsatop(Htop):
     def __init__(self):
         super().__init__()
 
-    def _parse_processes(self, include_priority: bool = False) -> List[Process]:
-        """Función auxiliar para obtener los procesos, threads y kthreads.
+    def _is_sighup_ignored(self, status_path: str) -> bool:
+        """Llegeix el fitxer status i comprova si el senyal SIGHUP (1) està a SigIgn."""
+        if not os.path.exists(status_path):
+            return False
+        try:
+            with open(status_path, "r") as f:
+                for line in f:
+                    if line.startswith("SigIgn:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            sig_ign_hex = parts[1]
+                            sig_ign_val = int(sig_ign_hex, 16)
+                            return (sig_ign_val & SIGHUP_MASK) != 0
+        except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+            pass
+        return False
 
-        Si include_priority es True, lee e incluye la prioridad.
+    def _parse_processes(
+        self, include_priority: bool = False, filter_sighup: bool = False
+    ) -> List[Process]:
+        """Funció auxiliar per extreure processos, threads i kthreads.
+
+        - include_priority: inclou el valor numèric de la prioritat.
+        - filter_sighup: si és True, només retorna aquells que ignoren SIGHUP.
         """
         processes: List[Process] = []
 
@@ -30,6 +53,7 @@ class Amsatop(Htop):
                 proc_path = os.path.join(self.proc_folder, pid)
                 stat_file = os.path.join(proc_path, "stat")
                 comm_file = os.path.join(proc_path, "comm")
+                status_file = os.path.join(proc_path, "status")
 
                 if not os.path.exists(stat_file):
                     continue
@@ -60,33 +84,36 @@ class Amsatop(Htop):
                 if len(after_comm) >= 7:
                     flags = int(after_comm[6])
 
-                # En /proc/{pid}/stat, la prioridad es el campo 18 (índice 15 tras la comanda)
                 if include_priority and len(after_comm) >= 16:
                     priority_val = int(after_comm[15])
 
-                # Comprobar si es Kernel Thread
+                ignores_hup = self._is_sighup_ignored(status_file)
+
+                # Comprovar si és Kernel Thread (kthread)
                 if (flags & PF_KTHREAD) != 0:
+                    if not filter_sighup or ignores_hup:
+                        processes.append(
+                            Process(
+                                pid=int(pid),
+                                command=command,
+                                type=TaskType.KTHREAD,
+                                priority=priority_val,
+                            )
+                        )
+                    continue
+
+                # Procés normal
+                if not filter_sighup or ignores_hup:
                     processes.append(
                         Process(
                             pid=int(pid),
                             command=command,
-                            type=TaskType.KTHREAD,
+                            type=TaskType.PROCESS,
                             priority=priority_val,
                         )
                     )
-                    continue
 
-                # Proceso normal
-                processes.append(
-                    Process(
-                        pid=int(pid),
-                        command=command,
-                        type=TaskType.PROCESS,
-                        priority=priority_val,
-                    )
-                )
-
-                # Threads secundarios
+                # Threads secundaris
                 task_folder = os.path.join(proc_path, "task")
                 if os.path.exists(task_folder):
                     try:
@@ -96,8 +123,15 @@ class Amsatop(Htop):
 
                     for tid in tids:
                         if tid.isdigit() and tid != pid:
-                            thread_stat_file = os.path.join(task_folder, tid, "stat")
-                            thread_comm_file = os.path.join(task_folder, tid, "comm")
+                            thread_stat_file = os.path.join(
+                                task_folder, tid, "stat"
+                            )
+                            thread_comm_file = os.path.join(
+                                task_folder, tid, "comm"
+                            )
+                            thread_status_file = os.path.join(
+                                task_folder, tid, "status"
+                            )
 
                             thread_cmd = None
                             thread_priority = None
@@ -127,14 +161,22 @@ class Amsatop(Htop):
                             if thread_cmd is None:
                                 continue
 
-                            processes.append(
-                                Process(
-                                    pid=int(tid),
-                                    command=thread_cmd,
-                                    type=TaskType.THREAD,
-                                    priority=thread_priority,
-                                )
+                            thread_ignores_hup = self._is_sighup_ignored(
+                                thread_status_file
                             )
+                            if not thread_ignores_hup:
+                                # Si no té status propi al thread, comprovem el del procés pare
+                                thread_ignores_hup = ignores_hup
+
+                            if not filter_sighup or thread_ignores_hup:
+                                processes.append(
+                                    Process(
+                                        pid=int(tid),
+                                        command=thread_cmd,
+                                        type=TaskType.THREAD,
+                                        priority=thread_priority,
+                                    )
+                                )
 
             except (FileNotFoundError, ProcessLookupError, PermissionError):
                 continue
@@ -142,10 +184,10 @@ class Amsatop(Htop):
         return processes
 
     def get_processes(self) -> List[Process]:
-        return self._parse_processes(include_priority=False)
+        return self._parse_processes(include_priority=False, filter_sighup=False)
 
     def get_priorities(self) -> List[Process]:
-        return self._parse_processes(include_priority=True)
+        return self._parse_processes(include_priority=True, filter_sighup=False)
 
     def get_hup(self) -> List[Process]:
-        raise NotImplementedError("Prac-2.3 implementation needed")
+        return self._parse_processes(include_priority=True, filter_sighup=True)
